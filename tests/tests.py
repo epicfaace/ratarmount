@@ -73,3 +73,38 @@ assert stenciledFile.tell() == 26
 assert stenciledFile.read( 1 ) == b""
 assert stenciledFile.seek( -6, io.SEEK_END ) == 0
 assert stenciledFile.read( 1 ) == b"2"
+
+
+# JoinedFile
+
+tmpDir = tempfile.TemporaryDirectory()
+fileSizes = [2,2,2,4,8,1]
+filePaths = [ os.path.join( tmpDir.name, str(i) ) for i in range( len( fileSizes ) ) ]
+i = 0
+for path, size in zip( filePaths, fileSizes ):
+    with open( path, 'wb' ) as file:
+        file.write( ''.join( [ chr( i + j ) for j in range( size ) ] ).encode() )
+    i += size
+
+print( "Test JoinedFile._findStencil" )
+joinedFile = ratarmount.JoinedFile( filePaths )
+expectedResults = [ 0,0, 1,1, 2,2, 3,3,3,3, 4,4,4,4,4,4,4,4, 5 ]
+for offset, iExpectedStencil in enumerate( expectedResults ):
+    assert joinedFile._findStencil( offset ) == iExpectedStencil
+
+print( "Test JoinedFile with single file" )
+
+assert ratarmount.JoinedFile( [ filePaths[0] ] ).read( 1 ) == b"\x00"
+assert ratarmount.JoinedFile( [ filePaths[0] ] ).read( 2 ) == b"\x00\x01"
+assert ratarmount.JoinedFile( [ filePaths[0] ] ).read() == b"\x00\x01"
+
+print( "Test JoinedFile using two files" )
+
+joinedFile = ratarmount.JoinedFile( filePaths[:2] )
+assert joinedFile.read() == b"\x00\x01\x02\x03"
+for i in [0,1,2,3,2,1,0,2,0,2]:
+    joinedFile.seek( i )
+    joinedFile.tell() == i
+    assert joinedFile.read( 1 ) == chr( i ).encode()
+joinedFile.seek( 0, io.SEEK_END )
+assert joinedFile.tell() == 4

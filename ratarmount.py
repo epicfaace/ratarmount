@@ -109,6 +109,134 @@ class ProgressBar:
         self.lastUpdateTime = time.time()
         self.lastUpdateValue = value
 
+class JoinedFile(io.BufferedIOBase):
+    """A file abstraction layer giving a joined view to one file split into parts."""
+
+    def __init__( self, filePaths ):
+        self.filePaths = []
+        self.sizes = []
+        self.fileobj = None
+        self.currentFile = None
+
+        for path in filePaths:
+            if not os.path.isfile( path ):
+                raise Exception( "File {} does not exist!".format( path ) )
+            size = os.stat( path ).st_size
+            if size > 0:
+                self.filePaths.append( path )
+                self.sizes.append( size )
+
+        # Calculate cumulative sizes
+        self.cumsizes = [ 0 ]
+        for size in self.sizes:
+            assert size > 0
+            self.cumsizes.append( self.cumsizes[-1] + size )
+
+        # Seek to the first stencil offset in the underlying file so that "read" will work out-of-the-box
+        self.seek( 0 )
+
+    def _findStencil( self, offset ):
+        """
+        Return index to file to which the offset belongs to. E.g., for file sizes [5,2], offsets 0 to
+        and including 4 will still be inside the first file, i.e., index 0 will be returned. For offset 6,
+        index 1 would be returned because it now is in the second file.
+        """
+        # bisect_left( value ) gives an index for a lower range: value < x for all x in list[0:i]
+        # Because value >= 0 and list starts with 0 we can therefore be sure that the returned i>0
+        # Consider the file sizes [2,2,2] -> cumsizes [0,2,4,6]. Seek to offset 2 should seek to the second entry.
+        assert offset >= 0
+        i = bisect.bisect_left( self.cumsizes, offset + 1 ) - 1
+        assert i >= 0
+        return i
+
+    @overrides(io.BufferedIOBase)
+    def close(self):
+        self.fileobj.close()
+        self.fileobj = None
+        self.currentFile = None
+
+    @overrides(io.BufferedIOBase)
+    def fileno(self):
+        if self.fileobj is not None:
+            return self.fileobj.fileno()
+        return -1
+
+    @overrides(io.BufferedIOBase)
+    def seekable(self):
+        return True
+
+    @overrides(io.BufferedIOBase)
+    def readable(self):
+        return True
+
+    @overrides(io.BufferedIOBase)
+    def writable(self):
+        return False
+
+    @overrides(io.BufferedIOBase)
+    def read(self, size=-1):
+        if size == -1:
+            size = self.cumsizes[-1] - self.offset
+
+        # This loop works in a kind of leapfrog fashion. On each even loop iteration it opens the next file
+        # and on each odd iteration it reads the data and increments the offset inside the file!
+        result = b''
+        i = self._findStencil( self.offset )
+        while size > 0 and i < len( self.sizes ):
+            # Read as much as requested or as much as the current file contains
+            readableSize = min( size, self.sizes[i] - ( self.offset - self.cumsizes[i] ) )
+            if readableSize == 0:
+                # Go to next file
+                i += 1
+                if i >= len( self.filePaths ):
+                    break
+
+                self.fileobj.close()
+                self.fileobj = open( self.filePaths[i], 'rb' )
+            else:
+                # Actually read data
+                tmp = self.fileobj.read( readableSize )
+                self.offset += len( tmp )
+                result += tmp
+                size -= readableSize
+                # Now, either size is 0 or readableSize will be 0 in the next iteration
+
+        return result
+
+    @overrides(io.BufferedIOBase)
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_CUR:
+            self.offset += offset
+        elif whence == io.SEEK_END:
+            self.offset = self.cumsizes[-1] + offset
+        elif whence == io.SEEK_SET:
+            self.offset = offset
+
+        if self.offset < 0:
+            raise Exception("Trying to seek before the start of the file!")
+        if self.offset >= self.cumsizes[-1]:
+            return self.offset
+
+        i = self._findStencil( self.offset )
+        offsetInsideFile = self.offset - self.cumsizes[i]
+        assert offsetInsideFile >= 0
+        assert offsetInsideFile < self.sizes[i]
+
+        # After determining where to seek to, actually do it
+        if i != self.currentFile:
+            if self.fileobj is not None and not self.fileobj.closed:
+                self.fileobj.close()
+            self.fileobj = open( self.filePaths[i], 'rb' )
+
+        self.fileobj.seek( offsetInsideFile, io.SEEK_SET )
+
+        return self.offset
+
+    @overrides(io.BufferedIOBase)
+    def tell(self):
+        return self.offset
+
+
 class StenciledFile(io.BufferedIOBase):
     """A file abstraction layer giving a stenciled view to an underlying file."""
 
