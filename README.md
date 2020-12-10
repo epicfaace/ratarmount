@@ -8,16 +8,31 @@
 [![Telegram](https://img.shields.io/badge/Chat-Telegram-%2330A3E6)](https://t.me/joinchat/FUdXxkXIv6c4Ib8bgaSxNg)
 
 Combines the random access indexing idea from [tarindexer](https://github.com/devsnd/tarindexer) and then **mounts** the **TAR** using [fusepy](https://github.com/fusepy/fusepy) for easy read-only access just like [archivemount](https://github.com/cybernoid/archivemount/).
-It also will mount TARs inside TARs inside TARs, ... **recursively** into folders of the same name, which is useful for the ImageNet data set.
-Furthermore, it now has support for **BZip2** compressed TAR archives provided by [indexed_bzip2](https://github.com/mxmlnkn/indexed_bzip2), a refactored and extended version of [bzcat](https://github.com/landley/toybox/blob/c77b66455762f42bb824c1aa8cc60e7f4d44bdab/toys/other/bzcat.c) from [toybox](https://landley.net/code/toybox/), and support for **Gzip** compressed TAR archives provided by the [indexed_gzip](https://github.com/pauldmccarthy/indexed_gzip) dependency.
+In [contrast](https://github.com/libarchive/libarchive#notes-about-the-library-design) to [libarchive](https://github.com/libarchive/libarchive), on which archivemount is based, random access and true seeking is supported.
+Currently, these compression backends are supported for random access:
+
+ - **BZip2** as provided by [indexed_bzip2](https://github.com/mxmlnkn/indexed_bzip2) as a backend, which is a refactored and extended version of [bzcat](https://github.com/landley/toybox/blob/c77b66455762f42bb824c1aa8cc60e7f4d44bdab/toys/other/bzcat.c) from [toybox](https://landley.net/code/toybox/).
+ - **Gzip** as provided by [indexed_gzip](https://github.com/pauldmccarthy/indexed_gzip) by Paul McCarthy.
+ - **Xz** as provided by [lzmaffi](https://github.com/r3m0t/backports.lzma) by Tomer Chachamu.
+ - **Zstd** as provided by [indexed_zstd](https://github.com/martinellimarco/indexed_zstd) by Marco Martinelli.
+
+Ratarmount also will mount TARs inside TARs inside TARs, ... **recursively** into folders of the same name, which is useful for the 1.31TB ImageNet data set.
+Furthermore, it supports **union mounting** so that multiple TARs can be mounted at one mountpoint.
+And it also supports **bind mounting** for usecases like merging a backup TAR with newer versions of those files, which are not packed.
 
 
 # Table of Contents
 1. [Installation](#installation)
 2. [Usage](#usage)
+    1. [Metadata Index Cache](#metadata-index-cache)
+    2. [Bind Mounting](#bind-mounting)
+    3. [Union Mounting](#union-mounting)
+    4. [File versions](#file-versions)
+    4. [Xz and Zst Files](#xz-and-zst-files)
 3. [The Problem](#the-problem)
 4. [The Solution](#the-solution)
 5. [Benchmarks](benchmarks/BENCHMARKS.md)
+
 
 # Installation
 
@@ -31,13 +46,17 @@ Or, if you want to test the latest version:
 pip install git+https://github.com/mxmlnkn/ratarmount.git@develop#egginfo=ratarmount
 ```
 
-You can also simply download [ratarmount.py](https://github.com/mxmlnkn/ratarmount/raw/master/ratarmount.py) and call it directly after installing the dependencies manually with: `pip3 install --user fusepy indexed_bzip2 indexed_gzip lzmaffi`.
+You can also simply download [ratarmount.py](https://github.com/mxmlnkn/ratarmount/raw/master/ratarmount.py) and call it directly after installing the dependencies manually with: `pip3 install --user fusepy indexed_bzip2 indexed_gzip indexed_zstd`.
 
-If you want to use other serialization backends instead of the default SQLite one, e.g., because you still have indexes lying around created with those backends and don't want to spend time recreating them, then you'll have to install a version older than 0.5.0 with the optional `legacy-serializers` feature:
+In order to use, the xz backend, you currently have to do more manual setup because [lzmaffi](https://github.com/r3m0t/backports.lzma) does not provide wheels.
+On Ubuntu 20.10 or similar systems, the setup would look like this:
 
+```bash
+sudo apt install liblzma-dev
+pip3 install --user cffi # Necessary because of a bug(?) in the lzmaffi setup.py
+pip3 install --user lzmaffi
 ```
-pip install ratarmount[legacy-serializers]==0.4.1
-```
+
 
 # Usage
 
@@ -219,6 +238,48 @@ by default shown version has 1024 bytes. So, in order to look at the oldest
 version, you can simply do:
     cat mountpoint/foo.versions/1
 
+## Xz and Zst Files
+
+In contrast to bzip2 and gzip compressed files, true seeking on xz and zst files is only possible at block or frame boundaries.
+This wouldn't be noteworthy, if both standard compressors for [xz](https://tukaani.org/xz/) and [zstd](https://github.com/facebook/zstd) were not by default creating unsuited files.
+Even though both file formats do support multiple frames and xz even contains a frame table at the end for easy seeking, both compressors write only a single frame and/or block out, making this feature unusable.
+In order to generate truly seekable compressed files, you'll have to use [pixz](https://github.com/vasi/pixz) for xz files.
+For zstd compressed files, no easily solution seems to exist although an [issue](https://github.com/facebook/zstd/issues/2121) does exist.
+The easiest solution is to simply split the original file into parts, compress those parts, and then concatenate those parts together to get a suitable multiframe zst file.
+Here is a bash function, which can be used for that:
+
+```bash
+function createMultiFrameZstd()
+{
+    local file frameSize fileSize offset frameFile
+    file=$1
+    frameSize=$2
+
+    if [[ ! -f "$file" ]]; then echo "Could not find file '$file'." 1>&2; return 1; fi
+    if [[ ! $frameSize =~ ^[0-9]+$ ]]; then echo "Frame size '$frameSize' is not a valid number." 1>&2; fi
+
+    fileSize=$( stat -c %s -- "$file" )
+
+    if [[ -d --tmpdir=/dev/shm ]]; then frameFile=$( mktemp --tmpdir=/dev/shm ); fi
+    if [[ -z $frameFile ]]; then frameFile=$( mktemp ); fi
+    if [[ -z $frameFile ]]; then echo "Could not create a temporary file for the frames." 1>2; return 1; fi
+    trap "'rm' -- '$frameFile'" EXIT
+
+    > "$file.zst"
+    for (( offset = 0; offset < fileSize; offset += frameSize )); do
+        dd if="$file" of="$frameFile" bs=$(( 1024*1024 )) \
+           iflag=skip_bytes,count_bytes skip="$offset" count="$frameSize" 2>/dev/null
+        zstd -c -q -f --no-progress -- "$frameFile" >> "$file.zst"
+    done
+}
+```
+
+In order to compress a file named `foo` into a multiframe zst file called `foo.zst`, which contains frames sized 4MiB of uncompressed ata, you would call it like this:
+
+```bash
+createMultiFrameZstd foo  $(( 4*1024*1024 ))
+```
+
 
 # The Problem
 
@@ -251,6 +312,7 @@ I didn't find out about [TAR Browser](https://github.com/tomorrow-nf/tar-as-file
   - Hard to find. I don't seem to be the only one who has trouble finding it as it has zero stars on Github after 4 years compared to 29 stars for tarindexer after roughly the same amount of time.
   - Hassle to set up. Needs compilation and I gave up when I was instructed to set up a MySQL database for it to use. Confusingly, the setup instructions are not on its Github but [here](https://web.wpi.edu/Pubs/E-project/Available/E-project-030615-133259/unrestricted/TARBrowserFinal.pdf).
   - Doesn't seem to support recursive TAR mounting. I didn't test it because of the MysQL dependency but the code does not seem to have logic for recursive mounting.
+  - Xz compression also is only block or frame based, i.e., only works faster with files created by [pixz](https://github.com/vasi/pixz) or [pxz](https://github.com/jnovy/pxz).
 
 Pros:
   - supports bz2- and xz-compressed TAR archives
