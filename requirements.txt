@@ -1,1 +1,1 @@
-indexed_gzip_fileobj_fork_epicfaace==1.4.1
+indexed_gzip==1.5.0
