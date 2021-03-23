@@ -1,1 +1,1 @@
-indexed_gzip==1.5.0
+indexed_gzip==1.5.3
